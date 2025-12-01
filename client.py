@@ -9,8 +9,9 @@ class FIFOClient:
         self.running = True
         self.connected = False
         self.client_name = None
-        self.fifo_request = "/tmp/ping_pong_request"
-        self.fifo_response = "/tmp/ping_pong_response"
+        self.fifo_main = "/tmp/ping_pong_main"
+        self.fifo_request = None
+        self.fifo_response = None
         
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -39,7 +40,7 @@ class FIFOClient:
         print("Подключение к серверу...")
         start_time = time.time()
         while time.time() - start_time < timeout:
-            if os.path.exists(self.fifo_request) and os.path.exists(self.fifo_response):
+            if os.path.exists(self.fifo_main):
                 return True
             time.sleep(0.1)
         
@@ -47,6 +48,8 @@ class FIFOClient:
     
     def send_message(self, message):
         """Отправка сообщения серверу"""
+        if not os.path.exists(self.fifo_request):
+            return False
         try:
             with open(self.fifo_request, 'w') as f:
                 f.write(message)
@@ -57,12 +60,13 @@ class FIFOClient:
     
     def receive_response(self):
         """Получение ответа от сервера"""
+        if not os.path.exists(self.fifo_response):
+            return None
         try:
             with open(self.fifo_response, 'r') as f:
                 response = f.read().strip()
             return response
         except Exception as e:
-            print(f"Ошибка получения ответа: {e}")
             return None
     
     def connect(self):
@@ -71,16 +75,29 @@ class FIFOClient:
             print("Ошибка: Сервер не запущен")
             return False
         
+        # Устанавливаем пути к персональным FIFO
+        self.fifo_request = f"/tmp/ping_pong_{self.client_name}_req"
+        self.fifo_response = f"/tmp/ping_pong_{self.client_name}_resp"
+        
         # Отправляем имя для регистрации
         print(f"Регистрация как '{self.client_name}'...")
         
-        if not self.send_message(f"CONNECT:{self.client_name}"):
+        try:
+            with open(self.fifo_main, 'w') as f:
+                f.write(self.client_name)
+        except Exception as e:
+            print(f"Ошибка регистрации: {e}")
             return False
         
-        response = self.receive_response()
-        
-        if response != "OK":
-            print(f"Ошибка: Не удалось подключиться ({response})")
+        # Ждём создания персональных FIFO
+        timeout = 5
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if os.path.exists(self.fifo_request) and os.path.exists(self.fifo_response):
+                break
+            time.sleep(0.1)
+        else:
+            print("Ошибка: Сервер не создал каналы")
             return False
         
         print(f"Успешно подключено к серверу!")
@@ -94,19 +111,16 @@ class FIFOClient:
         """Отключение от сервера"""
         if not self.connected:
             return
-            
-        try:
-            if os.path.exists(self.fifo_request):
-                with open(self.fifo_request, 'w') as f:
-                    f.write("DISCONNECT")
-                if os.path.exists(self.fifo_response):
-                    with open(self.fifo_response, 'r') as f:
-                        f.read()
-        except:
-            pass
         
         self.connected = False
         self.running = False
+            
+        try:
+            if self.fifo_request and os.path.exists(self.fifo_request):
+                with open(self.fifo_request, 'w') as f:
+                    f.write("DISCONNECT")
+        except:
+            pass
     
     def run(self):
         """Запуск клиента"""
@@ -115,7 +129,7 @@ class FIFOClient:
         if not self.connect():
             return
         
-        print("\nВведите 'ping' или 'пинг' (exit - выход, shutdown - завершить сервер)")
+        print("\nВведите 'ping' или 'пинг' (exit - выход)")
         
         try:
             while self.running:
@@ -130,21 +144,14 @@ class FIFOClient:
                 if message.lower() == 'exit':
                     break
                 
-                if message.lower() == 'shutdown':
-                    print("[Отправка запроса] -> 'SHUTDOWN'")
-                    self.send_message("SHUTDOWN")
-                    self.receive_response()
-                    print("Сервер завершён")
-                    self.connected = False
-                    break
-                
                 # Состояние 1: Отправка запроса
                 print(f"[Отправка запроса] -> '{message}'")
                 
                 if not self.send_message(message):
-                    # Состояние 4: Обработка ошибки
-                    print("[Ошибка] Не удалось отправить сообщение")
-                    continue
+                    # Сервер отключился
+                    print("Сервер отключился")
+                    self.connected = False
+                    break
                 
                 # Состояние 2: Ожидание ответа
                 print("[Ожидание ответа]")
@@ -152,9 +159,10 @@ class FIFOClient:
                 response = self.receive_response()
                 
                 if response is None:
-                    # Состояние 4: Обработка ошибки
-                    print("[Ошибка] Не удалось получить ответ")
-                    continue
+                    # Сервер отключился
+                    print("Сервер отключился")
+                    self.connected = False
+                    break
                 
                 # Состояние 3: Получение ответа
                 print(f"[Получен ответ] <- '{response}'")
@@ -165,7 +173,7 @@ class FIFOClient:
             print(f"Ошибка: {e}")
         finally:
             self.disconnect()
-            print("Клиент завершил работу")
+            print("Сеанс завершён")
 
 
 if __name__ == "__main__":

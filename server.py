@@ -3,13 +3,14 @@ import os
 import sys
 import signal
 import atexit
+import threading
 
 class FIFOServer:
     def __init__(self):
         self.running = True
-        self.fifo_request = "/tmp/ping_pong_request"
-        self.fifo_response = "/tmp/ping_pong_response"
-        self.current_client = None
+        self.fifo_main = "/tmp/ping_pong_main"
+        self.clients = {}
+        self.lock = threading.Lock()
         
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -24,50 +25,96 @@ class FIFOServer:
     def cleanup(self):
         """Очистка FIFO файлов"""
         print("Очистка FIFO файлов...")
-        for fifo in [self.fifo_request, self.fifo_response]:
-            if os.path.exists(fifo):
-                try:
-                    os.unlink(fifo)
-                    print(f"Удален FIFO: {fifo}")
-                except Exception as e:
-                    print(f"Ошибка удаления {fifo}: {e}")
+        # Удаляем главный FIFO
+        if os.path.exists(self.fifo_main):
+            try:
+                os.unlink(self.fifo_main)
+                print(f"Удален FIFO: {self.fifo_main}")
+            except Exception as e:
+                print(f"Ошибка удаления {self.fifo_main}: {e}")
+        
+        # Удаляем все клиентские FIFO
+        import glob
+        for fifo in glob.glob("/tmp/ping_pong_*"):
+            try:
+                os.unlink(fifo)
+                print(f"Удален FIFO: {fifo}")
+            except:
+                pass
     
     def create_fifos(self):
-        """Создание FIFO каналов"""
+        """Создание главного FIFO канала"""
         self.cleanup()
         try:
-            os.mkfifo(self.fifo_request)
-            os.mkfifo(self.fifo_response)
-            print(f"Созданы FIFO:")
-            print(f"  Запросы:  {self.fifo_request}")
-            print(f"  Ответы:   {self.fifo_response}")
+            os.mkfifo(self.fifo_main)
+            print(f"Создан FIFO: {self.fifo_main}")
             return True
         except Exception as e:
             print(f"Ошибка создания FIFO: {e}")
             return False
     
     def process_message(self, message):
-        # Регистрация нового клиента
-        if message.startswith("CONNECT:"):
-            client_name = message[8:].strip()
-            self.current_client = client_name
-            return "OK", False, True, False 
-        # Отключение
-        if message.upper() == "DISCONNECT":
-            return "OK", True, False, False
-        
-        # Завершение сервера
-        if message.upper() == "SHUTDOWN":
-            return "OK", True, False, True
-        
-        # Обычные команды
         if message.lower() == "ping":
-            return "pong", False, False, False
+            return "pong"
         elif message.lower() == "пинг":
-            return "понг", False, False, False
+            return "понг"
         else:
-            print(f"[Ошибка] Неизвестная команда: '{message}'")
-            return "ERROR: Unknown command", False, False, False
+            return "ERROR: Unknown command"
+    
+    def handle_client(self, client_name):
+        """Обработка клиента в отдельном потоке"""
+        fifo_request = f"/tmp/ping_pong_{client_name}_req"
+        fifo_response = f"/tmp/ping_pong_{client_name}_resp"
+        try:
+            os.mkfifo(fifo_request)
+            os.mkfifo(fifo_response)
+        except:
+            return
+        
+        print(f"\n[+] Клиент '{client_name}' подключился")
+        
+        try:
+            while self.running:
+                # Состояние 1: Ожидание запроса
+                try:
+                    with open(fifo_request, 'r') as f:
+                        message = f.read().strip()
+                except:
+                    break
+                
+                if not message:
+                    continue
+                
+                if message.upper() == "DISCONNECT":
+                    break
+                
+                print(f"[{client_name}] Получено: '{message}'")
+                print(f"[{client_name}] [Обработка запроса]")
+                
+                response = self.process_message(message)
+                
+                print(f"[{client_name}] [Отправка ответа] -> '{response}'")
+                
+                try:
+                    with open(fifo_response, 'w') as f:
+                        f.write(response)
+                except:
+                    break
+                    
+        finally:
+            # Очистка
+            for fifo in [fifo_request, fifo_response]:
+                if os.path.exists(fifo):
+                    try:
+                        os.unlink(fifo)
+                    except:
+                        pass
+            
+            with self.lock:
+                if client_name in self.clients:
+                    del self.clients[client_name]
+            
+            print(f"[-] Клиент '{client_name}' отключился")
     
     def run(self):
         """Запуск сервера"""
@@ -78,43 +125,31 @@ class FIFOServer:
         
         try:
             while self.running:
-                # Состояние 1: Ожидание запроса
-                print("\n[Ожидание запроса]")
+                print("\n[Ожидание подключения]")
                 
                 try:
-                    with open(self.fifo_request, 'r') as f:
-                        message = f.read().strip()
+                    with open(self.fifo_main, 'r') as f:
+                        client_name = f.read().strip()
                 except Exception as e:
-                    print(f"Ошибка чтения: {e}")
+                    if self.running:
+                        print(f"Ошибка чтения: {e}")
                     continue
                 
-                if not message:
+                if not client_name:
                     continue
-                response, disconnect, is_connect, shutdown = self.process_message(message)
                 
-                if is_connect:
-                    print(f"[+] Клиент '{self.current_client}' подключился")
-                    print("[Обработка запроса]")
-                else:
-                    print(f"Получено: '{message}'")
-                    print("[Обработка запроса]")
-                print(f"[Отправка ответа] -> '{response}'")
-                
-                try:
-                    with open(self.fifo_response, 'w') as f:
-                        f.write(response)
-                except Exception as e:
-                    print(f"Ошибка отправки: {e}")
-                
-                if shutdown:
-                    print(f"[-] Клиент '{self.current_client}' завершил работу сервера")
-                    self.running = False
-                    break
-                
-                if disconnect:
-                    print(f"[-] Клиент '{self.current_client}' отключился")
-                    self.current_client = None
-                    print("\nОжидание нового подключения...")
+                with self.lock:
+                    if client_name in self.clients:
+                        print(f"[!] Клиент '{client_name}' уже подключен")
+                        continue
+                    
+                    thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_name,),
+                        daemon=True
+                    )
+                    self.clients[client_name] = thread
+                    thread.start()
                     
         except Exception as e:
             if self.running:
