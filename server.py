@@ -2,6 +2,7 @@
 import os
 import sys
 import signal
+import glob
 import atexit
 import threading
 
@@ -34,7 +35,6 @@ class FIFOServer:
                 print(f"Ошибка удаления {self.fifo_main}: {e}")
         
         # Удаляем все клиентские FIFO
-        import glob
         for fifo in glob.glob("/tmp/ping_pong_*"):
             try:
                 os.unlink(fifo)
@@ -162,3 +162,4 @@ class FIFOServer:
 if __name__ == "__main__":
     server = FIFOServer()
     server.run()
+
