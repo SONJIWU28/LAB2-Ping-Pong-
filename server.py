@@ -1,165 +1,123 @@
 #!/usr/bin/env python3
 import os
-import sys
-import signal
-import glob
-import atexit
-import threading
+import fcntl
+import time
 
-class FIFOServer:
-    def __init__(self):
-        self.running = True
-        self.fifo_main = "/tmp/ping_pong_main"
-        self.clients = {}
-        self.lock = threading.Lock()
-        
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-        atexit.register(self.cleanup)
-    
-    def signal_handler(self, signum, frame):
-        print("\nСервер завершает работу...")
-        self.running = False
-        self.cleanup()
-        sys.exit(0)
-    
-    def cleanup(self):
-        """Очистка FIFO файлов"""
-        print("Очистка FIFO файлов...")
-        # Удаляем главный FIFO
-        if os.path.exists(self.fifo_main):
-            try:
-                os.unlink(self.fifo_main)
-                print(f"Удален FIFO: {self.fifo_main}")
-            except Exception as e:
-                print(f"Ошибка удаления {self.fifo_main}: {e}")
-        
-        # Удаляем все клиентские FIFO
-        for fifo in glob.glob("/tmp/ping_pong_*"):
-            try:
-                os.unlink(fifo)
-                print(f"Удален FIFO: {fifo}")
-            except:
-                pass
-    
-    def create_fifos(self):
-        """Создание главного FIFO канала"""
-        self.cleanup()
+shared_file = "/tmp/pp_shared.txt"
+lock_file = "/tmp/pp_shared.lock"
+server_lock = "/tmp/pp_server.lock"
+buf_size = 16
+
+client_msg = "_C:"
+server_msg = "_S:"
+error_msg = "_ERR"
+
+
+def read_from_file():
+    lk = None
+    fd = None
+    try:
+        lk = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lk, fcntl.LOCK_SH)
+        fd = os.open(shared_file, os.O_RDONLY)
+        data = os.read(fd, buf_size)
+        return data.decode().strip('\x00')
+    except:
+        return ""
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if lk is not None:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            os.close(lk)
+
+
+def write_to_file(text):
+    lk = None
+    fd = None
+    try:
+        lk = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        fd = os.open(shared_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        os.write(fd, text.encode()[:buf_size])
+        return True
+    except:
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if lk is not None:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            os.close(lk)
+
+
+def cleanup():
+    for f in (shared_file, lock_file):
         try:
-            os.mkfifo(self.fifo_main)
-            print(f"Создан FIFO: {self.fifo_main}")
-            return True
-        except Exception as e:
-            print(f"Ошибка создания FIFO: {e}")
-            return False
-    
-    def process_message(self, message):
-        if message.lower() == "ping":
-            return "pong"
-        elif message.lower() == "пинг":
-            return "понг"
-        else:
-            return "ERROR: Unknown command"
-    
-    def handle_client(self, client_name):
-        """Обработка клиента в отдельном потоке"""
-        fifo_request = f"/tmp/ping_pong_{client_name}_req"
-        fifo_response = f"/tmp/ping_pong_{client_name}_resp"
-        try:
-            os.mkfifo(fifo_request)
-            os.mkfifo(fifo_response)
+            os.remove(f)
         except:
-            return
-        
-        print(f"\n[+] Клиент '{client_name}' подключился")
-        
-        try:
-            while self.running:
-                # Состояние 1: Ожидание запроса
-                try:
-                    with open(fifo_request, 'r') as f:
-                        message = f.read().strip()
-                except:
-                    break
-                
-                if not message:
-                    continue
-                
-                if message.upper() == "DISCONNECT":
-                    break
-                
-                print(f"[{client_name}] Получено: '{message}'")
-                print(f"[{client_name}] [Обработка запроса]")
-                
-                response = self.process_message(message)
-                
-                print(f"[{client_name}] [Отправка ответа] -> '{response}'")
-                
-                try:
-                    with open(fifo_response, 'w') as f:
-                        f.write(response)
-                except:
-                    break
-                    
-        finally:
-            # Очистка
-            for fifo in [fifo_request, fifo_response]:
-                if os.path.exists(fifo):
-                    try:
-                        os.unlink(fifo)
-                    except:
-                        pass
-            
-            with self.lock:
-                if client_name in self.clients:
-                    del self.clients[client_name]
-            
-            print(f"[-] Клиент '{client_name}' отключился")
-    
-    def run(self):
-        """Запуск сервера"""
-        if not self.create_fifos():
-            return
-        
-        print("Сервер запущен. Ожидание подключений...")
-        
-        try:
-            while self.running:
-                print("\n[Ожидание подключения]")
-                
-                try:
-                    with open(self.fifo_main, 'r') as f:
-                        client_name = f.read().strip()
-                except Exception as e:
-                    if self.running:
-                        print(f"Ошибка чтения: {e}")
-                    continue
-                
-                if not client_name:
-                    continue
-                
-                with self.lock:
-                    if client_name in self.clients:
-                        print(f"[!] Клиент '{client_name}' уже подключен")
-                        continue
-                    
-                    thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_name,),
-                        daemon=True
-                    )
-                    self.clients[client_name] = thread
-                    thread.start()
-                    
-        except Exception as e:
-            if self.running:
-                print(f"Ошибка в основном цикле сервера: {e}")
-        finally:
-            self.cleanup()
-            print("Сервер завершил работу")
+            pass
+    print("Server: shared files cleared")
 
 
-if __name__ == "__main__":
-    server = FIFOServer()
-    server.run()
+def try_lock_server():
+    try:
+        fd = os.open(server_lock, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except:
+        return None
 
+
+srv_fd = try_lock_server()
+if srv_fd is None:
+    print("Server: another instance already running")
+    exit(1)
+
+cleanup()
+print("=== Server started ===")
+
+state = 1
+received = ""
+
+try:
+    while True:
+        if state == 1:
+            req = read_from_file()
+            if req and req.startswith(client_msg):
+                received = req[len(client_msg):]
+                print("Server: message received from client: \"" + received + "\"")
+                state = 2
+        elif state == 2:
+            print("Server: message processing")
+            if received == "ping":
+                state = 3
+            else:
+                print("Server: message is not ping")
+                state = 4
+        elif state == 3:
+            print("Server: sending response to client")
+            if write_to_file(server_msg + "pong"):
+                print("Server: response have sent: \"pong\"")
+                print()
+                state = 1
+            else:
+                state = 4
+        elif state == 4:
+            print("Server: unexpected error")
+            write_to_file(error_msg)
+            print()
+            time.sleep(0.5)
+            state = 1
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    pass
+
+fcntl.flock(srv_fd, fcntl.LOCK_UN)
+os.close(srv_fd)
+try:
+    os.remove(server_lock)
+except:
+    pass
+cleanup()
+print("=== Server stopped ===")
