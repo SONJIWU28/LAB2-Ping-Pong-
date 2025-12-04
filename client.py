@@ -3,7 +3,7 @@ import os
 import fcntl
 import time
 
-shared_file = "/tmp/pp_shared.txt"
+shared_file = "/tmp/pp_shared.dat"
 lock_file = "/tmp/pp_shared.lock"
 buf_size = 16
 
