@@ -1,106 +1,97 @@
-#!/usr/bin/env python3
 import os
 import fcntl
-import time
+import sys
 
-shared_file = "/tmp/pp_shared.dat"
-lock_file = "/tmp/pp_shared.lock"
-buf_size = 16
-
-client_msg = "_C:"
-server_msg = "_S:"
-error_msg = "_ERR"
-
+SHARED = "/tmp/pp_shared.txt"
+LOCK = "/tmp/pp_shared.lock"
+SERVER_LOCK = "/tmp/pp_server.lock"
+last_sent = ""
+server_lk = None
 
 def read_and_clear():
-    """Read message and clear file atomically - only one server gets the message"""
-    lk = None
-    fd = None
+    global last_sent
+    lk = fd = None
     try:
-        lk = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        lk = os.open(LOCK, os.O_CREAT | os.O_RDWR)
         fcntl.flock(lk, fcntl.LOCK_EX)
-        fd = os.open(shared_file, os.O_RDWR)
-        data = os.read(fd, buf_size).decode().strip('\x00')
-        if data and data.startswith(client_msg):
+        fd = os.open(SHARED, os.O_CREAT | os.O_RDWR)
+        data = os.read(fd, 16).decode('utf-8', errors='ignore').strip('\x00')
+        if data and data!=last_sent:
+            os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
+            last_sent = ""
             return data
         return ""
-    except:
-        return ""
+    except Exception: return ""
     finally:
-        if fd is not None:
-            os.close(fd)
+        if fd is not None: os.close(fd)
         if lk is not None:
             fcntl.flock(lk, fcntl.LOCK_UN)
             os.close(lk)
 
-
-def write_to_file(text):
-    lk = None
-    fd = None
+def write_file(text):
+    global last_sent
+    lk = fd = None
     try:
-        lk = os.open(lock_file, os.O_CREAT | os.O_RDWR)
+        lk = os.open(LOCK, os.O_CREAT | os.O_RDWR)
         fcntl.flock(lk, fcntl.LOCK_EX)
-        fd = os.open(shared_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        os.write(fd, text.encode()[:buf_size])
+        fd = os.open(SHARED, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        encoded = text.encode('utf-8')
+        os.write(fd, encoded)
+        last_sent=text
         return True
-    except:
-        return False
+    except Exception: return False
     finally:
         if fd is not None:
             os.close(fd)
         if lk is not None:
             fcntl.flock(lk, fcntl.LOCK_UN)
             os.close(lk)
-
 
 def cleanup():
-    for f in (shared_file, lock_file):
-        try:
-            os.remove(f)
-        except:
-            pass
-    print("Server: shared files cleared")
+    for f in (SHARED, LOCK):
+        try: os.remove(f)
+        except Exception: pass
 
+def acquire_server_lock():
+    global server_lk
+    try:
+        server_lk = os.open(SERVER_LOCK, os.O_CREAT | os.O_RDWR)
+        fcntl.flock(server_lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (IOError, OSError):
+        return False
+    
+def release_server_lock():
+    global server_lk
+    if server_lk is not None:
+        fcntl.flock(server_lk, fcntl.LOCK_UN)
+        os.close(server_lk)
+        server_lk = None
 
+if not acquire_server_lock():
+    print("already running", file=sys.stderr)
+    sys.exit(1)
 cleanup()
-print("=== Server started ===")
-
+print("started")
 state = 1
-received = ""
-
 try:
     while True:
         if state == 1:
-            req = read_and_clear()
-            if req:
-                received = req[len(client_msg):]
-                print("Server: message received from client: \"" + received + "\"")
-                state = 2
+            msg = read_and_clear()
+            if msg:
+                print(f"get: {msg}")
+                if msg == "ping":state = 2
+                else:
+                    print(f"unknown command: {msg}")
+                    if write_file("error"):print("sent: error")
         elif state == 2:
-            print("Server: message processing")
-            if received == "ping":
-                state = 3
-            else:
-                print("Server: message is not ping")
-                state = 4
-        elif state == 3:
-            print("Server: sending response to client")
-            if write_to_file(server_msg + "pong"):
-                print("Server: response have sent: \"pong\"")
-                print()
+            if write_file("pong"):
+                print("sent: pong")
                 state = 1
-            else:
-                state = 4
-        elif state == 4:
-            print("Server: error state")
-            write_to_file(error_msg)
-            print()
-            time.sleep(0.5)
-            state = 1
-        time.sleep(0.2)
-except KeyboardInterrupt:
-    pass
-
+except KeyboardInterrupt: pass
 cleanup()
-print("=== Server stopped ===")
+release_server_lock()
+try: os.remove(SERVER_LOCK)
+except Exception: pass
+print("stopped")
